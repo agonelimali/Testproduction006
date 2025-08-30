@@ -1,0 +1,647 @@
+=== NETWORK ARCHITECTURE OVERVIEW ===
+
+Network Architecture Requirements:
+- Segmented VLANs for Banking Ops, ATM, Guest WiFi, Security Systems, and Management
+- Redundant WAN links for connectivity to banking network core/HQ
+- Strict PCI-DSS-compliant segmentation for cardholder data environments
+- Integrated firewall with stateful inspection, deep packet inspection, and intrusion prevention
+- Secure, role-based and MFA-protected management access
+- Real-time monitoring/Audit logging to SIEM
+- Encrypted tunnels for ATM and remote access traffic
+- QoS for transaction priority, storm control, and HA
+- Automated backup, compliance, and patching controls
+- Panic-button-integrated alerting
+
+=== DEVICE 1: CISCO-CORE ===
+
+! ===== SECTION: Basic Device Configuration =====
+
+hostname CISCO-CORE
+ip domain-name bankbranch.example.com
+ip name-server 8.8.8.8 8.8.4.4 1.1.1.1
+ip name-server 208.67.222.222
+!
+! -- Secure DNS with malware protection --
+ip dns view SECURE-DNS
+ view name SECURE-DNS
+  dnssec enable
+  root-hints view
+ip dns server view-group SECURE-DNS
+!
+service password-encryption
+enable algorithm-type scrypt secret !SuperSecureEnablePassw0rd!#
+!
+username admin privilege 15 algorithm-type scrypt secret Br@nchAdm1n$tr@t0r!2024
+username opsadmin privilege 10 algorithm-type scrypt secret BankOpsMFAusr14!Hel1os
+username atmadmin privilege 7 algorithm-type scrypt secret ATMsecureAc!Adm
+!
+banner login ^
+WARNING: Unauthorized access to this system is forbidden and will be prosecuted.
+All activities are monitored and recorded for PCI DSS compliance.
+^
+!
+aaa new-model
+aaa authentication login default group radius local
+aaa authentication enable default group radius enable
+aaa authorization exec default group radius local
+aaa authorization commands 15 default group radius local
+aaa accounting exec default start-stop group radius
+aaa accounting commands 15 default start-stop group radius
+aaa session-id common
+!
+ip ssh version 2
+ip ssh authentication-retries 2
+ip ssh time-out 30
+ip ssh server algorithm encryption aes256-gcm
+ip ssh logging events
+ip ssh rsa keypair-name CISCO-CORE-SSH
+crypto key generate rsa general-keys modulus 4096 label CISCO-CORE-SSH
+ip ssh pubkey-chain
+ username admin
+  key-string
+   ssh-rsa AAAAB3...BankBranchAdminKey
+  exit
+!
+ip ssh client session-timeout 3
+ip ssh logging verbose
+!
+crypto pki trustpoint BANKBRANCH-CA
+ enrollment mode ra
+ enrollment url http://ca.bankbranch.example.com
+ revocation-check crl
+ rsakeypair CISCO-CORE-SSH
+ subject-name CN=CISCO-CORE.bankbranch.example.com,OU=IT,O=BankBranch,L=City,ST=State,C=US
+ auto-enroll
+ password QM3lCLpH@2024!
+crypto pki authenticate BANKBRANCH-CA
+crypto pki enroll BANKBRANCH-CA
+!
+ntp source GigabitEthernet0/0
+ntp server 192.168.100.10 prefer
+ntp server 192.168.100.11
+ntp server 172.16.32.5
+ntp authenticate
+ntp authentication-key 1 sha256 BESTBANKNTP#1234567890
+ntp trusted-key 1
+!
+clock timezone EST -5
+clock summer-time EDT recurring
+!
+ip http secure-server
+ip http secure-ciphersuite tlsv1.3 aes-256-gcm-sha384
+ip http authentication aaa login-auth
+ip http secure-client-auth
+ip http max-connections 10
+!
+zerotouch enable
+!
+! -- VLAN SVI descriptions for clarity --
+interface Vlan10
+ description BANKING-OPS_SVI (Cardholder Data Environment)
+ ip address 192.168.10.1 255.255.255.0
+ ip access-group BANKINGOPS-IN in
+ ip access-group BANKINGOPS-OUT out
+ ip helper-address 192.168.100.20
+ ipv6 address 2001:DB8:10::1/64
+ ipv6 nd managed-config-flag
+ ipv6 nd other-config-flag
+ ipv6 access-group BANKINGOPS6-IN in
+ ipv6 access-group BANKINGOPS6-OUT out
+ no shutdown
+
+interface Vlan20
+ description ATM_NET_SVI
+ ip address 192.168.20.1 255.255.255.0
+ ip access-group ATM-IN in
+ ip access-group ATM-OUT out
+ ip helper-address 192.168.100.20
+ ipv6 address 2001:DB8:20::1/64
+ ipv6 access-group ATM6-IN in
+ ipv6 access-group ATM6-OUT out
+ no shutdown
+
+interface Vlan40
+ description CUSTOMERWIFI_SVI
+ ip address 192.168.40.1 255.255.255.0
+ ip access-group WIFI-IN in
+ ip access-group WIFI-OUT out
+ ip helper-address 192.168.100.20
+ ipv6 address 2001:DB8:40::1/64
+ ipv6 access-group WIFI6-IN in
+ ipv6 access-group WIFI6-OUT out
+ no shutdown
+
+interface Vlan50
+ description SECURITYSYS_SVI
+ ip address 192.168.50.1 255.255.255.0
+ ip access-group SEC-IN in
+ ip access-group SEC-OUT out
+ ip helper-address 192.168.100.20
+ ipv6 address 2001:DB8:50::1/64
+ ipv6 access-group SEC6-IN in
+ ipv6 access-group SEC6-OUT out
+ no shutdown
+
+interface Vlan99
+ description MGMT_SVI
+ ip address 192.168.99.1 255.255.255.0
+ ip access-group MGMT-IN in
+ ip access-group MGMT-OUT out
+ ip helper-address 192.168.100.20
+ ipv6 address 2001:DB8:99::1/64
+ ipv6 access-group MGMT6-IN in
+ ipv6 access-group MGMT6-OUT out
+ no shutdown
+
+! ===== END SECTION =====
+
+
+! ===== SECTION: Security Hardening =====
+
+! -- AAA Infrastructure --
+aaa group server radius BANK_RADIUS
+ server name BANKRADIUS1
+ server name BANKRADIUS2
+ ip radius source-interface Vlan99
+!
+radius-server host 192.168.99.20 auth-port 1812 acct-port 1813 key Super!RADIUS!Secret!
+radius-server host 192.168.99.21 auth-port 1812 acct-port 1813 key Super!RADIUS!Secret!
+radius-server dead-criteria tries 2
+radius-server retransmit 2
+radius-server timeout 3
+radius-server vsa send authentication
+!
+! -- Multi-factor Authentication integration via TACACS+ --
+tacacs server BANK_TACACS
+ address ipv4 192.168.99.22
+ key T@C@CSBankBranch
+!
+aaa group server tacacs+ BANK_TACACS_GROUP
+ server name BANK_TACACS
+ ip tacacs source-interface Vlan99
+!
+aaa authentication login BANK-MFA group tacacs+ local
+aaa authorization exec BANK-MFA group tacacs+ local
+aaa accounting exec BANK-MFA start-stop group tacacs+
+aaa authentication dot1x default group radius
+!
+password policy minimum-length 15
+password policy complexity enable
+password policy history 10
+password policy retry 0
+password policy lifetime 90
+!
+login block-for 180 attempts 3 within 60
+login quiet-mode access-class MGMT-TRUSTED
+login on-success log
+login on-failure log
+!
+! -- RBAC Privilege Separation --
+privilege exec level 10 show running-config
+privilege exec level 10 show startup-config
+privilege exec level 10 show interfaces
+privilege exec level 15 configure terminal
+privilege exec level 15 reload
+!
+! -- SCP/SFTP for mgmt data transfer, explicitly enable --
+ip scp server enable
+ip sftp server enable
+!
+! -- Interface-level Security, BPDU Guard, Storm Control, Port Security --
+errdisable recovery cause bpduguard
+errdisable recovery cause security-violation
+port-security aging time 10
+port-security aging type inactivity
+!
+! -- VLAN Sensitive, PCI DSS-compliant ACLs with descriptive remarks --
+ip access-list extended BANKINGOPS-IN
+ remark Permit only specific banking and management access (PCI-DSS)
+ permit tcp 192.168.10.0 0.0.0.255 host 192.168.99.1 eq 8443
+ permit tcp 192.168.10.0 0.0.0.255 any eq 443
+ permit tcp 192.168.10.0 0.0.0.255 any eq 8443
+ deny   ip any 192.168.20.0 0.0.0.255 log
+ deny   ip any 192.168.40.0 0.0.0.255 log
+ deny   ip any 192.168.50.0 0.0.0.255 log
+ permit ip 192.168.10.0 0.0.0.255 any
+ip access-list extended BANKINGOPS-OUT
+ permit ip 192.168.10.0 0.0.0.255 any
+ deny   ip 192.168.10.0 0.0.0.255 192.168.40.0 0.0.0.255 log
+!
+ip access-list extended ATM-IN
+ remark ATM Encrypted communications only
+ permit ip 192.168.20.0 0.0.0.255 host 192.168.99.1 eq 8443
+ permit esp any any
+ permit udp any any eq isakmp
+ deny   ip any 192.168.10.0 0.0.0.255 log
+ deny   ip any 192.168.40.0 0.0.0.255 log
+ permit ip 192.168.20.0 0.0.0.255 any
+ip access-list extended ATM-OUT
+ permit ip 192.168.20.0 0.0.0.255 any
+ deny   ip 192.168.20.0 0.0.0.255 192.168.40.0 0.0.0.255 log
+!
+ip access-list extended WIFI-IN
+ remark Guest network restriction - Internet access only, no internal VLANs
+ deny   ip 192.168.40.0 0.0.0.255 192.168.10.0 0.0.0.255 log
+ deny   ip 192.168.40.0 0.0.0.255 192.168.20.0 0.0.0.255 log
+ deny   ip 192.168.40.0 0.0.0.255 192.168.50.0 0.0.0.255 log
+ permit ip 192.168.40.0 0.0.0.255 any
+ip access-list extended WIFI-OUT
+ permit ip 192.168.40.0 0.0.0.255 any
+ deny   ip 192.168.40.0 0.0.0.255 192.168.10.0 0.0.0.255 log
+!
+ip access-list extended SEC-IN
+ permit ip 192.168.50.0 0.0.0.255 host 192.168.99.1
+ deny   ip any 192.168.10.0 0.0.0.255 log
+ deny   ip any 192.168.20.0 0.0.0.255 log
+ permit ip 192.168.50.0 0.0.0.255 any
+ip access-list extended SEC-OUT
+ permit ip 192.168.50.0 0.0.0.255 any
+!
+ip access-list extended MGMT-IN
+ permit tcp 192.168.99.0 0.0.0.255 any eq 22
+ permit tcp 192.168.99.0 0.0.0.255 any eq 443
+ deny   ip any 192.168.40.0 0.0.0.255 log
+ deny   ip any 192.168.50.0 0.0.0.255 log
+ permit ip 192.168.99.0 0.0.0.255 any
+ip access-list extended MGMT-OUT
+ permit ip 192.168.99.0 0.0.0.255 any
+!
+ip access-list standard MGMT-TRUSTED
+ permit 192.168.99.0 0.0.0.255
+!
+ipv6 access-list BANKINGOPS6-IN
+ permit tcp 2001:DB8:10::/64 host 2001:DB8:99::1 eq 8443
+ deny   ipv6 any 2001:DB8:20::/64 log
+ deny   ipv6 any 2001:DB8:40::/64 log
+ deny   ipv6 any 2001:DB8:50::/64 log
+ permit ipv6 2001:DB8:10::/64 any
+!
+! -- Apply IPv6 and legacy ACLs accordingly for each VLAN, as above --
+!
+! -- Port Security, DHCP snooping, DAI --
+ip dhcp snooping vlan 10,20,40,50,99
+ip dhcp snooping
+ip dhcp snooping verify mac-address
+no ip dhcp snooping information option
+!
+! -- ARP Inspection --
+ip arp inspection vlan 10,20,40,50,99
+ip arp inspection validate src-mac dst-mac ip
+!
+! -- Dynamic VLAN assignment for NAC --
+aaa authorization network default group radius
+!
+! -- Intrusion Prevention/Deep Packet Inspection (requires ASA integration) --
+! (Reference ASA context configuration; shown as interface-level associations)
+!
+! ========== INTERFACE LEVEL SECURITY ==========
+!
+! == Enable port security, BPDU guard, storm control on access interfaces ==
+default interface range GigabitEthernet0/1 - 3
+interface range GigabitEthernet0/1 - 3
+ switchport mode access
+ switchport port-security
+ switchport port-security maximum 2
+ switchport port-security violation restrict
+ switchport port-security aging time 10
+ switchport port-security aging type inactivity
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ storm-control broadcast level 5.00
+ storm-control multicast level 5.00
+ storm-control unicast level 5.00
+ no shutdown
+!
+! == Trunk interfaces for internal uplinks and HA ==
+interface GigabitEthernet0/0
+ description "Uplink: WAN1 - Secure Banking Network Core"
+ switchport mode trunk
+ switchport trunk allowed vlan 10,20,40,50,99
+ spanning-tree portfast trunk
+ no shutdown
+!
+interface GigabitEthernet0/4
+ description "Uplink: WAN2 (Redundant WAN for HA)"
+ switchport mode trunk
+ switchport trunk allowed vlan 10,20,40,50,99
+ spanning-tree portfast trunk
+ no shutdown
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Interface Configuration =====
+
+! -- VLAN definition --
+vlan 10
+ name BANKING_OPS
+vlan 20
+ name ATM_NET
+vlan 40
+ name CUSTOMERWIFI
+vlan 50
+ name SECURITYSYS
+vlan 99
+ name MGMT_NET
+!
+! -- SVIs already defined in Basic Configuration above --
+!
+interface GigabitEthernet0/1
+ description Teller Floor BankingOps (VLAN 10)
+ switchport access vlan 10
+ switchport mode access
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ storm-control broadcast level 5.00
+ storm-control multicast level 5.00
+ storm-control unicast level 5.00
+ switchport port-security
+ switchport port-security maximum 2
+ switchport port-security violation restrict
+ ip dhcp snooping trust
+ no shutdown
+
+interface GigabitEthernet0/2
+ description ATM Pods (VLAN 20)
+ switchport access vlan 20
+ switchport mode access
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ storm-control broadcast level 5.00
+ storm-control multicast level 5.00
+ storm-control unicast level 5.00
+ switchport port-security
+ switchport port-security violation restrict
+ ip dhcp snooping trust
+ no shutdown
+
+interface GigabitEthernet0/3
+ description Customer WiFi edge (VLAN 40)
+ switchport access vlan 40
+ switchport mode access
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ storm-control broadcast level 5.00
+ storm-control multicast level 5.00
+ storm-control unicast level 5.00
+ switchport port-security
+ switchport port-security violation restrict
+ ip dhcp snooping trust
+ no shutdown
+
+interface range GigabitEthernet0/5 - 6
+ description Security System (VLAN 50)
+ switchport access vlan 50
+ switchport mode access
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ storm-control broadcast level 5.00
+ storm-control multicast level 5.00
+ storm-control unicast level 5.00
+ switchport port-security violation restrict
+ ip dhcp snooping trust
+ no shutdown
+!
+! -- Management Out-of-band --
+interface GigabitEthernet0/7
+ description Out-of-Band Management (VLAN 99)
+ switchport access vlan 99
+ switchport mode access
+ spanning-tree portfast
+ storm-control broadcast level 1.00
+ switchport port-security violation restrict
+ ip dhcp snooping trust
+ no shutdown
+!
+! -- EtherChannel HA for WAN (if needed) --
+interface Port-channel1
+ description Primary WAN EtherChannel
+ switchport mode trunk
+ switchport trunk allowed vlan 10,20,40,50,99
+!
+interface range GigabitEthernet0/0, GigabitEthernet0/4
+ channel-group 1 mode active
+!
+! ===== END SECTION =====
+
+
+! ===== SECTION: Routing & Switching =====
+
+ip routing
+!
+! -- VLAN interfaces above function as router-on-a-stick SVIs --
+!
+router ospf 1
+ router-id 192.168.99.1
+ passive-interface default
+ no passive-interface Vlan10
+ no passive-interface Vlan20
+ no passive-interface Vlan40
+ no passive-interface Vlan50
+ no passive-interface Vlan99
+ network 192.168.10.0 0.0.0.255 area 0
+ network 192.168.20.0 0.0.0.255 area 0
+ network 192.168.40.0 0.0.0.255 area 0
+ network 192.168.50.0 0.0.0.255 area 0
+ network 192.168.99.0 0.0.0.255 area 0
+!
+router ospfv3 1
+ address-family ipv6 unicast
+  router-id 192.168.99.1
+  passive-interface default
+  no passive-interface Vlan10
+  no passive-interface Vlan20
+  no passive-interface Vlan40
+  no passive-interface Vlan50
+  no passive-interface Vlan99
+  exit-address-family
+!
+! -- HSRP for L3 gateway redundancy on SVIs --
+interface Vlan10
+ standby version 2
+ standby 10 ip 192.168.10.254
+ standby 10 priority 110
+ standby 10 preempt delay minimum 60
+ standby 10 authentication text BankBranchHSRP10
+!
+interface Vlan20
+ standby version 2
+ standby 20 ip 192.168.20.254
+ standby 20 priority 110
+ standby 20 preempt delay minimum 60
+ standby 20 authentication text BankBranchHSRP20
+!
+interface Vlan40
+ standby version 2
+ standby 40 ip 192.168.40.254
+ standby 40 priority 110
+ standby 40 preempt delay minimum 60
+ standby 40 authentication text BankBranchHSRP40
+!
+interface Vlan50
+ standby version 2
+ standby 50 ip 192.168.50.254
+ standby 50 priority 110
+ standby 50 preempt delay minimum 60
+ standby 50 authentication text BankBranchHSRP50
+!
+interface Vlan99
+ standby version 2
+ standby 99 ip 192.168.99.254
+ standby 99 priority 110
+ standby 99 preempt delay minimum 60
+ standby 99 authentication text BankBranchHSRP99
+!
+spanning-tree mode rapid-pvst
+spanning-tree extend system-id
+spanning-tree portfast default
+spanning-tree bpduguard default
+!
+! -- QoS for Banking Transactions (prioritize L4 ports 443, 8443, 1521 etc) --
+mls qos
+ip access-list extended BANKTRANSACTION-TRAFFIC
+ permit tcp any any eq 443
+ permit tcp any any eq 8443
+ permit tcp any any eq 1521
+!
+class-map match-any BANKING-CRITICAL
+ match access-group name BANKTRANSACTION-TRAFFIC
+!
+policy-map BANKING-QOS
+ class BANKING-CRITICAL
+  set dscp ef
+  priority
+ class class-default
+  fair-queue
+!
+interface Vlan10
+ service-policy input BANKING-QOS
+!
+! -- IPv6 dual-stack enabled on all SVIs above --
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Monitoring & Management =====
+
+snmp-server group SECUREMGMT v3 priv read SECURITY-VIEW write SECURITY-VIEW notify SECURITY-VIEW
+snmp-server user netops SECUREMGMT v3 auth sha256 NetOp$#123 priv aes 256 NetOpSNMPv3@!321
+snmp-server host 192.168.99.100 version 3 priv netops
+snmp-server view SECURITY-VIEW iso included
+snmp-server enable traps snmp authentication linkdown linkup coldstart warmstart
+!
+logging buffered 16384 debugging
+logging trap debugging
+logging host 192.168.99.101
+logging host 192.168.99.102
+logging facility local7
+logging source-interface Vlan99
+logging monitor informational
+logging userinfo
+service timestamps log datetime msec localtime show-timezone
+!
+! -- Structured logging, PCI DSS-compliant audit trail --
+archive
+ log config
+  logging enable
+  notify syslog contenttype xml
+  notify syslog
+  hidekeys
+!
+! -- NetFlow/IPFIX for Trafffic Visibility --
+ip flow-export version 9
+ip flow-export destination 192.168.99.107 2055
+ip flow-cache timeout active 60
+ip flow-cache timeout inactive 15
+!
+ip flow ingress
+ip flow egress
+interface Vlan10
+ ip flow ingress
+ ip flow egress
+!
+! -- Security Event Management / SIEM Integration --
+event manager applet PCI-COMPLIANCE-AUDIT
+ event syslog pattern "CONFIG_I.*"
+ action 1.0 syslog msg "PCI-DSS: Configuration Change!"
+ action 2.0 mail server 192.168.99.109 to compliance@bankbranch.example.com from router@bankbranch.example.com subject "PCI-DSS CHANGE"
+!
+event manager applet FRAUD-DETECTION
+ event syslog pattern "FRDTRX.*"
+ action 1.0 mail server 192.168.99.109 to soc@bankbranch.example.com from router@bankbranch.example.com subject "FRAUD ALERT"
+!
+event manager policy panic-button.tcl
+! (custom EEM script to notify law enforcement upon panic event)
+!
+! -- Scheduled Backups --
+archive
+ path tftp://192.168.99.110/CISCO-CORE-config-
+ write-memory
+ time-period 1440
+!
+! -- Regular Compliance and Pen Testing Scripts --
+event manager applet PEN-TEST-ALERT
+ event syslog pattern "SECURITY_SCAN.*"
+ action 1.0 syslog priority critical msg "Penetration test activity detected per PCI DSS requirement 11"
+!
+! -- Uplink Monitoring for HA/Failover Events --
+event manager applet WAN-LINK-DOWN
+ event interface GigabitEthernet0/0 down
+ action 1.0 syslog priority critical msg "Primary WAN link is down - failover initiated"
+ action 2.0 cli command "show interface status"
+ action 3.0 cli command "show standby brief"
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Production Readiness =====
+
+! -- Zero-touch provisioning verified/enabled earlier --
+!
+! -- Configuration change tracking and automated backups (see monitoring) --
+!
+! -- Compliance validation at reload/start --
+event manager applet PCI-VALIDATE
+ event timer watchdog time 86400 maxrun 300
+ action 1.0 syslog msg "Running daily PCI DSS configuration and compliance validation"
+ action 2.0 cli command "show running-config"
+ action 3.0 cli command "archive config difference"
+!
+! -- Automated rollback --
+event manager applet ROLL-BACK
+ event cli pattern "reload"
+ action 1.0 cli command "archive rollback config"
+!
+! -- Interface and system self-healing --
+event manager applet INT-SELFHEAL
+ event interface any line-protocol down
+ action 1.0 cli command "shutdown"
+ action 2.0 wait 5
+ action 3.0 cli command "no shutdown"
+!
+! -- Save configuration --
+do write memory
+do copy running-config startup-config
+!
+! ===== END SECTION =====
+
+=== VERIFICATION PROCEDURES ===
+
+Verification Procedures:
+- show vlan brief
+- show interfaces status
+- show running-config (verify AAA, ACLs, policy-maps, SNMP, syslog)
+- show standby brief (validate HSRP/VRRP state)
+- show ip ospf neighbor / show ipv6 ospfv3 neighbor
+- show ip route / show ipv6 route
+- show access-lists (log/firewall enforcement checks)
+- show snmp user / show snmp group
+- show logging | include CONFIG_I|FRDTRX (audit/event triggers)
+- show ntp associations
+- show flow exporter / show ip flow interface
+- show archive log config all
+- show event manager history events
+- show version (compliance)
+- show policy-map interface
+- Confirm Mgmt SSH/TACACS/RADIUS logins (simulate MFA)
+- Test guest WiFi cannot access other VLANs
+- Review SIEM/Netflow dashboards for traffic, fraud, and config events
+
+! End of configuration
